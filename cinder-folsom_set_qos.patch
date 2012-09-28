@@ -1,0 +1,267 @@
+From ed798af9fa12f0bee668830aa5cc86f4f00cb111 Mon Sep 17 00:00:00 2001
+From: John Griffith <john.griffith@solidfire.com>
+Date: Thu, 27 Sep 2012 17:40:54 -0600
+Subject: [PATCH] Add capability to set QoS on Cinder Volumes
+
+This change implements IOP based QoS capabilities for thos Cinder
+back-ends that support it.  This includes min-iops, max-iops and burst-iops.
+
+Includes OS-API extensions for setting via cinderclient or other tools,
+Volume-API, Volume-Manager and Volume-Driver changes as needed.
+
+Associated python-cinderclient changes are also completed and currently
+held as WIP at Change-Id: I66d9fdecf7086dc72eea65d65ef1f7c35ed9ad10
+
+Implements cinder portion of blueprint add-qos-capability
+
+Change-Id: Id680fe233b1c0f0b445cd831e095f83c62a0b2dc
+---
+ .../api/openstack/volume/contrib/volume_actions.py |   16 +++++++
+ .../versions/003_add_volume_qos_columns.py         |   45 +++++++++++++++++++
+ cinder/db/sqlalchemy/models.py                     |    4 ++
+ cinder/tests/test_migrations.py                    |   18 ++++++++
+ cinder/volume/api.py                               |   11 +++++
+ cinder/volume/driver.py                            |    4 ++
+ cinder/volume/manager.py                           |   16 +++++++
+ cinder/volume/solidfire.py                         |   47 ++++++++++++++++++++
+ 8 files changed, 161 insertions(+)
+ create mode 100644 cinder/db/sqlalchemy/migrate_repo/versions/003_add_volume_qos_columns.py
+
+diff --git a/cinder/api/openstack/volume/contrib/volume_actions.py b/cinder/api/openstack/volume/contrib/volume_actions.py
+index 5c62766..197529d 100644
+--- a/cinder/api/openstack/volume/contrib/volume_actions.py
++++ b/cinder/api/openstack/volume/contrib/volume_actions.py
+@@ -73,6 +73,22 @@ class VolumeActionsController(wsgi.Controller):
+         super(VolumeActionsController, self).__init__(*args, **kwargs)
+         self.volume_api = volume.API()
+ 
++    @wsgi.action('setQos')
++    def _set_qos(self, req, id, body):
++        """Set qos values on volume."""
++        context = req.environ['cinder.context']
++        volume = self.volume_api.get(context, id)
++        min_iops = body['setQos']['min_iops']
++        max_iops = body['setQos']['max_iops']
++        burst_iops = body['setQos']['burst_iops']
++
++        self.volume_api.set_qos(context,
++                                volume,
++                                min_iops,
++                                max_iops,
++                                burst_iops)
++        return webob.Response(status_int=202)
++
+     @wsgi.action('os-attach')
+     def _attach(self, req, id, body):
+         """Add attachment metadata."""
+diff --git a/cinder/db/sqlalchemy/migrate_repo/versions/003_add_volume_qos_columns.py b/cinder/db/sqlalchemy/migrate_repo/versions/003_add_volume_qos_columns.py
+new file mode 100644
+index 0000000..451261b
+--- /dev/null
++++ b/cinder/db/sqlalchemy/migrate_repo/versions/003_add_volume_qos_columns.py
+@@ -0,0 +1,45 @@
++# vim: tabstop=4 shiftwidth=4 softtabstop=4
++
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from sqlalchemy import Column, Integer
++from sqlalchemy import MetaData, Table
++
++from nova.openstack.common import log as logging
++
++LOG = logging.getLogger(__name__)
++
++
++def upgrade(migrate_engine):
++    meta = MetaData()
++    meta.bind = migrate_engine
++
++    volumes = Table('volumes', meta, autoload=True)
++    min_iops = Column('min_iops', Integer())
++    max_iops = Column('max_iops', Integer())
++    burst_iops = Column('burst_iops', Integer())
++
++    LOG.error('jdg-debug: create the columns...')
++    volumes.create_column(min_iops)
++    volumes.create_column(max_iops)
++    volumes.create_column(burst_iops)
++
++
++def downgrade(migrate_engine):
++    meta = MetaData()
++    meta.bind = migrate_engine
++
++    volumes = Table('volumes', meta, autoload=True)
++    volumes.drop_column('min_iops')
++    volumes.drop_column('max_iops')
++    volumes.drop_column('burst_iops')
+diff --git a/cinder/db/sqlalchemy/models.py b/cinder/db/sqlalchemy/models.py
+index ae2a6f5..db748c0 100644
+--- a/cinder/db/sqlalchemy/models.py
++++ b/cinder/db/sqlalchemy/models.py
+@@ -157,6 +157,10 @@ class Volume(BASE, CinderBase):
+ 
+     volume_type_id = Column(Integer)
+ 
++    min_iops = Column(Integer)
++    max_iops = Column(Integer)
++    burst_iops = Column(Integer)
++
+ 
+ class VolumeMetadata(BASE, CinderBase):
+     """Represents a metadata key/value pair for a volume"""
+diff --git a/cinder/tests/test_migrations.py b/cinder/tests/test_migrations.py
+index 913baae..439e14e 100644
+--- a/cinder/tests/test_migrations.py
++++ b/cinder/tests/test_migrations.py
+@@ -302,3 +302,21 @@ class TestMigrations(test.TestCase):
+         self.assertEqual(version,
+                 migration_api.db_version(engine,
+                                          TestMigrations.REPOSITORY))
++
++    def test_migration_03(self):
++        """Test that add QoS works correctly."""
++        for key, engine in self.engines.items():
++            migration_api.version_control(engine, TestMigrations.REPOSITORY,
++                                          migration.INIT_VERSION)
++            migration_api.upgrade(engine, TestMigrations.REPOSITORY, 2)
++            metadata = sqlalchemy.schema.MetaData()
++            metadata.bind = engine
++
++            migration_api.upgrade(engine, TestMigrations.REPOSITORY, 3)
++            volumes = sqlalchemy.Table('volumes', metadata, autoload=True)
++            self.assertTrue(isinstance(volumes.c.min_iops.type,
++                                       sqlalchemy.types.INTEGER))
++            self.assertTrue(isinstance(volumes.c.max_iops.type,
++                                       sqlalchemy.types.INTEGER))
++            self.assertTrue(isinstance(volumes.c.burst_iops.type,
++                                       sqlalchemy.types.INTEGER))
+diff --git a/cinder/volume/api.py b/cinder/volume/api.py
+index e25fb81..52fa732 100644
+--- a/cinder/volume/api.py
++++ b/cinder/volume/api.py
+@@ -79,6 +79,17 @@ class API(base.Base):
+                               glance.get_default_image_service())
+         super(API, self).__init__(db_driver)
+ 
++    def set_qos(self, context, volume,
++                min_iops, max_iops, burst_iops):
++        host = volume['host']
++        queue = rpc.queue_get_for(context, FLAGS.volume_topic, host)
++        return rpc.call(context, queue,
++                        {"method": "set_volume_qos",
++                         "args": {"volume_id": volume['id'],
++                                  "min_iops": min_iops,
++                                  "max_iops": max_iops,
++                                  "burst_iops": burst_iops}})
++
+     def create(self, context, size, name, description, snapshot=None,
+                 image_id=None, volume_type=None, metadata=None,
+                 availability_zone=None):
+diff --git a/cinder/volume/driver.py b/cinder/volume/driver.py
+index 76077c6..a9eab14 100644
+--- a/cinder/volume/driver.py
++++ b/cinder/volume/driver.py
+@@ -286,6 +286,10 @@ class VolumeDriver(object):
+         """
+         return False
+ 
++    def set_volume_qos(self, context, volume, min_iops, max_iops, burst_iops):
++        """Set the volume QoS values."""
++        raise NotImplementedError()
++
+ 
+ class ISCSIDriver(VolumeDriver):
+     """Executes commands relating to ISCSI volumes.
+diff --git a/cinder/volume/manager.py b/cinder/volume/manager.py
+index fbefce2..4500609 100644
+--- a/cinder/volume/manager.py
++++ b/cinder/volume/manager.py
+@@ -447,3 +447,19 @@ class VolumeManager(manager.SchedulerDependentManager):
+         volume_utils.notify_about_volume_usage(
+                 context, volume, event_suffix,
+                 extra_usage_info=extra_usage_info, host=self.host)
++
++    def set_volume_qos(self, context,
++                       volume_id, min_iops,
++                       max_iops, burst_iops):
++            volume_ref = self.db.volume_get(context, volume_id)
++            try:
++                model_update = self.driver.set_volume_qos(context,
++                                           volume_ref,
++                                           min_iops,
++                                           max_iops,
++                                           burst_iops)
++            except exception.NotImplemented:
++                pass
++
++            if model_update:
++                self.db.volume_update(context, volume_ref['id'], model_update)
+diff --git a/cinder/volume/solidfire.py b/cinder/volume/solidfire.py
+index 0749237..496e153 100644
+--- a/cinder/volume/solidfire.py
++++ b/cinder/volume/solidfire.py
+@@ -421,3 +421,50 @@ class SolidFire(SanISCSIDriver):
+                                          % (sfaccount['username'],
+                                             chap_secret))
+         return model_update
++
++    def set_volume_qos(self, context,
++                       volume, min_iops,
++                       max_iops, burst_iops):
++        """Set the volume QoS values."""
++        model_update = {}
++
++        LOG.debug(_("Enter SolidFire set_qos..."))
++        sf_account_name = socket.gethostname() + '-' + volume['project_id']
++        sfaccount = self._get_sfaccount_by_name(sf_account_name)
++        if sfaccount is None:
++            raise exception.SfAccountNotFound(account_name=sf_account_name)
++
++        params = {'accountID': sfaccount['accountID']}
++        data = self._issue_api_request('ListVolumesForAccount', params)
++        if 'result' not in data:
++            raise exception.SolidFireAPIDataException(data=data)
++
++        seek = 'OS-VOLID-%s' % volume['id']
++        found_count = 0
++        volid = -1
++        for v in data['result']['volumes']:
++            if v['name'] == seek:
++                found_count += 1
++                volid = v['volumeID']
++
++        if found_count == 0:
++            raise exception.VolumeNotFound(volume_id=volume['id'])
++
++        if found_count > 1:
++            LOG.debug(_("Set QoS on volume: volumeID: %s"), volid)
++            raise exception.DuplicateSfVolumeNames(vol_name=volume['id'])
++
++        params = {'volumeID': volid,
++                  'qos': {'minIOPS': min_iops,
++                          'maxIOPS': max_iops,
++                          'burstIOPS': burst_iops}
++                 }
++
++        data = self._issue_api_request('ModifyVolume', params)
++        if 'result' not in data:
++            raise exception.SolidFireAPIDataException(data=data)
++
++        model_update['min_iops'] = min_iops
++        model_update['max_iops'] = max_iops
++        model_update['burst_iops'] = burst_iops
++        return model_update
+-- 
+1.7.9.5
+

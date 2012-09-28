@@ -1,0 +1,143 @@
+From 02e8e0b0f25ed1804584cb8ddf0b1c0ea1865ee0 Mon Sep 17 00:00:00 2001
+From: John Griffith <john.griffith@solidfire.com>
+Date: Thu, 27 Sep 2012 17:43:04 -0600
+Subject: [PATCH] Add set_qos capability to cinderclient
+
+Depends on Change-Id: Id680fe233b1c0f0b445cd831e095f83c62a0b2dc
+Implements the cinderclient half of blueprint add-qos-capability
+
+Change-Id: I66d9fdecf7086dc72eea65d65ef1f7c35ed9ad10
+---
+ cinderclient/shell.py      |    6 +++---
+ cinderclient/v1/shell.py   |   16 ++++++++++++++++
+ cinderclient/v1/volumes.py |   25 +++++++++++++++++++++++++
+ tests/v1/fakes.py          |    4 ++++
+ tests/v1/test_volumes.py   |    5 +++++
+ 5 files changed, 53 insertions(+), 3 deletions(-)
+
+diff --git a/cinderclient/shell.py b/cinderclient/shell.py
+index 0dfec5b..c738814 100644
+--- a/cinderclient/shell.py
++++ b/cinderclient/shell.py
+@@ -36,7 +36,7 @@ from cinderclient.v1 import shell as shell_v1
+ 
+ DEFAULT_OS_VOLUME_API_VERSION = "1"
+ DEFAULT_CINDER_ENDPOINT_TYPE = 'publicURL'
+-DEFAULT_CINDER_SERVICE_TYPE = 'compute'
++DEFAULT_CINDER_SERVICE_TYPE = 'volume'
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -127,7 +127,7 @@ class OpenStackCinderShell(object):
+ 
+         parser.add_argument('--service-type',
+                             metavar='<service-type>',
+-                            help='Defaults to compute for most actions')
++                            help='Defaults to volume for most actions')
+         parser.add_argument('--service_type',
+                             help=argparse.SUPPRESS)
+ 
+@@ -155,7 +155,7 @@ class OpenStackCinderShell(object):
+                             help=argparse.SUPPRESS)
+ 
+         parser.add_argument('--os-volume-api-version',
+-                            metavar='<compute-api-ver>',
++                            metavar='<volume-api-ver>',
+                             default=utils.env('OS_VOLUME_API_VERSION',
+                             default=DEFAULT_OS_VOLUME_API_VERSION),
+                             help='Accepts 1,defaults '
+diff --git a/cinderclient/v1/shell.py b/cinderclient/v1/shell.py
+index f30e816..d3a64f0 100644
+--- a/cinderclient/v1/shell.py
++++ b/cinderclient/v1/shell.py
+@@ -479,3 +479,19 @@ def do_rate_limits(cs, args):
+     limits = cs.limits.get().rate
+     columns = ['Verb', 'URI', 'Value', 'Remain', 'Unit', 'Next_Available']
+     utils.print_list(limits, columns)
++
++
++@utils.arg('min_iops', metavar='<min_iops>',
++           help='Minimum performance threshold in IOPs.')
++@utils.arg('max_iops', metavar='<max_iops>',
++           help='Maximum performance threshold in IOPs.')
++@utils.arg('burst_iops', metavar='<burst_iops>',
++           help='Allowed Burst rate in IOPs.')
++@utils.arg('volume', metavar='<volume>',
++           help='ID of the volume to set QoS for.')
++@utils.service_type('volume')
++def do_set_qos(cs, args):
++    """Set qos on a volume."""
++    _find_volume(cs, args.volume).set_qos(args.min_iops,
++                                          args.max_iops,
++                                          args.burst_iops)
+diff --git a/cinderclient/v1/volumes.py b/cinderclient/v1/volumes.py
+index ec1bf1a..8775c74 100644
+--- a/cinderclient/v1/volumes.py
++++ b/cinderclient/v1/volumes.py
+@@ -89,6 +89,16 @@ class Volume(base.Resource):
+         """
+         return self.manager.terminate_connection(self, connector)
+ 
++    def set_qos(self, min_iops, max_iops, burst_iops):
++        """
++        Set QOS levels on volume.
++
++        :param min_iops: Miniumum IOP threshold.
++        :param max_iops: Maximum IOP threshold.
++        :param burst_iops: Allowed burst threshold.
++        """
++        return self.manager.set_qos(self, min_iops, max_iops, burst_iops)
++
+ 
+ class VolumeManager(base.ManagerWithFind):
+     """
+@@ -311,3 +321,18 @@ class VolumeManager(base.ManagerWithFind):
+         """
+         self._action('os-terminate_connection', volume,
+                      {'connector': connector})
++
++    def set_qos(self, volume, min_iops, max_iops, burst_iops):
++        """
++        Set QOS levels on volume.
++
++        :param volume: The :cloass: `Volume` (or its ID).
++        :param min_iops: Miniumum IOP threshold.
++        :param max_iops: Maximum IOP threshold.
++        :param burst_iops: Allowed burst threshold.
++        """
++        self._action('setQos',
++                     volume,
++                     {'min_iops': min_iops,
++                      'max_iops': max_iops,
++                      'burst_iops': burst_iops})
+diff --git a/tests/v1/fakes.py b/tests/v1/fakes.py
+index 57fa31f..982ddce 100644
+--- a/tests/v1/fakes.py
++++ b/tests/v1/fakes.py
+@@ -135,6 +135,10 @@ class FakeHTTPClient(base_client.HTTPClient):
+             assert body[action] is None
+         elif action == 'os-roll_detaching':
+             assert body[action] is None
++        elif action == 'setQos':
++            assert body[action].keys() == ['burst_iops',
++                                           'max_iops',
++                                           'min_iops']
+         else:
+             raise AssertionError("Unexpected server action: %s" % action)
+         return (resp, _body)
+diff --git a/tests/v1/test_volumes.py b/tests/v1/test_volumes.py
+index 5600ddc..d10e122 100644
+--- a/tests/v1/test_volumes.py
++++ b/tests/v1/test_volumes.py
+@@ -60,3 +60,8 @@ class VolumesTest(utils.TestCase):
+         v = cs.volumes.get('1234')
+         cs.volumes.terminate_connection(v, {})
+         cs.assert_called('POST', '/volumes/1234/action')
++
++    def test_set_qos(self):
++        v = cs.volumes.get('1234')
++        cs.volumes.set_qos(v, 500, 1000, 1000)
++        cs.assert_called('POST', '/volumes/1234/action')
+-- 
+1.7.9.5
+
